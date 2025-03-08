@@ -43,9 +43,6 @@ def store_in_sqlite(article_text, country, sentiment, themes):
     conn.close()
     print(f"✅ Stored in SQLite with country {country}: {article_text[:50]}...")
 
-
-import re
-
 def parse_sentiment_and_themes(response_text):
     """
     Takes Perplexity's raw response text and normalizes it, removing stray asterisks
@@ -88,8 +85,6 @@ def parse_sentiment_and_themes(response_text):
         sentiment = "Unknown"
 
     return sentiment, themes
-
-
 
 # 3. Perplexity analysis function (for sentiment and themes)
 def analyze_with_perplexity(text):
@@ -134,7 +129,6 @@ def analyze_with_perplexity(text):
     # Use the new robust parser:
     sentiment, themes = parse_sentiment_and_themes(raw_text)
     return {"sentiment": sentiment, "themes": themes}
-
 
 # 4. Process each RabbitMQ message
 def process_message(ch, method, properties, body):

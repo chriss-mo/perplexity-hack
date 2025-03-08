@@ -5,7 +5,7 @@ import re
 from dotenv import load_dotenv
 import requests
 import sqlite3
-import pycountry  # for validating country names
+import pycountry
 
 # 1. Load environment variables
 load_dotenv()
@@ -13,20 +13,7 @@ API_KEY = os.getenv("PPLX_API_KEY")
 if not API_KEY:
     raise ValueError("Missing PPLX_API_KEY in .env file")
 
-# 2. Extract country from message text using the "nyt_geo:" keyword
-def extract_country(text):
-    # Look for <category domain="http://www.nytimes.com/namespaces/keywords/nyt_geo">CountryName</category>
-    match = re.search(r'<category\s+domain="http://www\.nytimes\.com/namespaces/keywords/nyt_geo">([^<]+)</category>', text)
-    if match:
-        country_candidate = match.group(1).strip()
-        try:
-            country = pycountry.countries.lookup(country_candidate)
-            return country.name  # Standardized country name
-        except LookupError:
-            return None
-    return None
-
-# 3. Setup SQLite DB (with an additional column for country)
+# 2. Setup SQLite DB (with an additional column for country)
 DB_FILE = "sentiment.db"
 
 def init_db():
@@ -35,7 +22,7 @@ def init_db():
     c.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        content TEXT NOT NULL,
+        content TEXT NOT NULL,    -- We'll store the combined article text (title+summary) here
         country TEXT,
         sentiment TEXT NOT NULL,
         themes TEXT NOT NULL,
@@ -45,18 +32,66 @@ def init_db():
     conn.commit()
     conn.close()
 
-def store_in_sqlite(message, country, sentiment, themes):
+def store_in_sqlite(article_text, country, sentiment, themes):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
         INSERT INTO messages (content, country, sentiment, themes)
         VALUES (?, ?, ?, ?)
-    """, (message, country, sentiment, json.dumps(themes)))
+    """, (article_text, country, sentiment, json.dumps(themes)))
     conn.commit()
     conn.close()
-    print(f"✅ Stored in SQLite with country {country}: {message[:50]}...")
+    print(f"✅ Stored in SQLite with country {country}: {article_text[:50]}...")
 
-# 4. Perplexity analysis function (for sentiment and themes)
+
+import re
+
+def parse_sentiment_and_themes(response_text):
+    """
+    Takes Perplexity's raw response text and normalizes it, removing stray asterisks
+    or partial words that might break the 'Sentiment:' parsing. Also attempts to clamp
+    sentiment to 'Positive', 'Negative', or 'Neutral' (or 'Unknown').
+    """
+
+    # 1) Remove all asterisks in one go, just in case there's '**', '***', etc.
+    cleaned_text = re.sub(r'\*+', '', response_text)
+
+    # 2) Split into lines
+    lines = cleaned_text.split("\n")
+    sentiment = "Unknown"
+    themes = []
+
+    for line in lines:
+        line = line.strip()
+        if line.startswith("Sentiment:"):
+            sentiment_raw = line.split(":", 1)[1].strip()
+            sentiment = sentiment_raw
+        elif line.startswith("Themes:"):
+            themes_raw = line.split(":", 1)[1]
+            themes = [t.strip() for t in themes_raw.split(",")]
+
+    # 3) If we got something like "Unknown\nNegative", remove 'Unknown'
+    sentiment = sentiment.replace("Unknown", "").strip()
+    if not sentiment:
+        sentiment = "Unknown"
+
+    # 4) Lowercase and clamp to known categories if desired
+    #    e.g. if you see "slightly negative" or "very negative", just treat as "Negative"
+    sentiment_lower = sentiment.lower()
+    if "positive" in sentiment_lower:
+        sentiment = "Positive"
+    elif "negative" in sentiment_lower:
+        sentiment = "Negative"
+    elif "neutral" in sentiment_lower:
+        sentiment = "Neutral"
+    else:
+        sentiment = "Unknown"
+
+    return sentiment, themes
+
+
+
+# 3. Perplexity analysis function (for sentiment and themes)
 def analyze_with_perplexity(text):
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
@@ -83,6 +118,7 @@ def analyze_with_perplexity(text):
         "frequency_penalty": 1,
         "response_format": None
     }
+
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
@@ -93,39 +129,56 @@ def analyze_with_perplexity(text):
         raise Exception(f"Request to Perplexity API failed: {response.status_code} - {response.text}")
 
     data = response.json()
-    content = data["choices"][0]["message"]["content"]
+    raw_text = data["choices"][0]["message"]["content"]
 
-    sentiment = "Unknown"
-    themes = []
-    for line in content.split("\n"):
-        if line.startswith("Sentiment:"):
-            sentiment = line.split(":", 1)[1].strip()
-        elif line.startswith("Themes:"):
-            themes = [t.strip() for t in line.split(":", 1)[1].split(",")]
+    # Use the new robust parser:
+    sentiment, themes = parse_sentiment_and_themes(raw_text)
     return {"sentiment": sentiment, "themes": themes}
 
-# 5. Process each RabbitMQ message
-def process_message(ch, method, properties, body):
-    message = body.decode("utf-8")
-    print(f"📩 Received: {message[:50]}...")
 
-    # Extract country info from the message
-    country = extract_country(message)
-    if not country:
-        print("Skipping message because no valid country was found.")
+# 4. Process each RabbitMQ message
+def process_message(ch, method, properties, body):
+    # Decode the JSON payload that the producer sends
+    message_str = body.decode("utf-8")
+    data = json.loads(message_str)
+
+    title = data.get("title", "")
+    summary = data.get("summary", "")
+    countries = data.get("countries", [])
+    # Combine title and summary as the "text" we'll analyze
+    article_text = f"{title}\n{summary}".strip()
+
+    print(f"📩 Received: {title[:50]}... with {len(countries)} country candidates.")
+
+    # Find a valid country
+    valid_country = None
+    for c in countries:
+        # e.g. "St Louis (Mo)" -> remove parentheses
+        c_clean = re.sub(r"\(.*?\)", "", c).strip()
+        try:
+            found_country = pycountry.countries.lookup(c_clean)
+            valid_country = found_country.name  # standardize
+            break
+        except LookupError:
+            # If c_clean isn't recognized, we ignore
+            pass
+
+    if not valid_country:
+        print("Skipping article because no valid country was found.")
         return
 
     try:
-        result = analyze_with_perplexity(message)
+        # Run sentiment analysis via Perplexity
+        result = analyze_with_perplexity(article_text)
         sentiment = result.get("sentiment", "Unknown")
         themes = result.get("themes", [])
 
-        print(f"✅ Sentiment: {sentiment}, Themes: {themes}, Country: {country}")
-        store_in_sqlite(message, country, sentiment, themes)
+        print(f"✅ Sentiment: {sentiment}, Themes: {themes}, Country: {valid_country}")
+        store_in_sqlite(article_text, valid_country, sentiment, themes)
     except Exception as e:
         print(f"❌ Error processing message: {e}")
 
-# 6. Consume from RabbitMQ
+# 5. Consume from RabbitMQ
 def consume_from_rabbitmq():
     init_db()
     connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))

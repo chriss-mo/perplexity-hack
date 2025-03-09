@@ -29,7 +29,7 @@ def get_data():
     conn = sqlite3.connect("sentiment.db")
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT content, country, sentiment, themes, created_at
+        SELECT DISTINCT content, country, sentiment, themes, created_at
         FROM messages
         ORDER BY id DESC
     """)
@@ -139,6 +139,7 @@ else:
 
     if search_query:
         search_results = df[df.apply(lambda row: search_query.lower() in row.to_string().lower(), axis=1)]
+        search_results = search_results.drop_duplicates(subset=["content"])
         st.sidebar.write(f"### Search Results for '{search_query}'")
         for _, row in search_results.iterrows():
             st.sidebar.write(f"- {row['content']}")
